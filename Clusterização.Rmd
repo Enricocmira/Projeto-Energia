@@ -1,0 +1,165 @@
+---
+title: "Relatório de Análise de Clusterização (K-Means)"
+author: "Relatório Automatizado"
+date: "`r Sys.Date()`"
+output:
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  html_document:
+    theme: flatly
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+# Configuração global dos chunks
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+```
+
+## 1. Introdução e Preparação dos Dados
+
+Este relatório apresenta os resultados da análise de clusterização aplicada às variáveis climáticas e hidrológicas da bacia. O objetivo é identificar diferentes "regimes" ou estados operacionais/climáticos do sistema.
+
+Nesta primeira etapa, os dados são importados, limpos e padronizados (Z-score) para que variáveis de diferentes escalas não dominem o algoritmo de distância do K-Means.
+
+```{r preparacao_dados}
+# Carregamento de pacotes
+library(clusterSim) 
+library(knitr)      
+library(tidyverse)
+library(readxl)
+library(cluster)    
+library(factoextra) 
+library(patchwork)  
+
+# 1. Importar os dados consolidados
+setwd("C:/Users/enric/Downloads")
+df_importado <- read_excel("Base_Consolidada.xlsx", 
+                           col_types = c("date", "numeric", "numeric", 
+                                         "numeric", "numeric", "numeric", 
+                                         "numeric", "numeric"))
+
+# 2. Limpeza de dados e remoção de variáveis não utilizadas na clusterização
+df_limpo <- df_importado %>%
+  mutate(across(-DataHora, ~ suppressWarnings(as.numeric(gsub(",", ".", .))))) %>%
+  dplyr::select(-Vazao_Captacao_m3_h, -Velocidade_Vento_m_s) %>%
+  drop_na()
+
+if(nrow(df_limpo) == 0) {
+  stop("ERRO: Após remover os NAs, o dataframe ficou com 0 linhas.")
+}
+
+# 3. Seleciona apenas as variáveis numéricas com variância válida
+df_modelo <- df_limpo %>% dplyr::select(-DataHora) %>% 
+  dplyr::select(where(~ is.numeric(.) && sum(!is.na(.)) > 1 && !is.na(var(., na.rm = TRUE)) && var(., na.rm = TRUE) > 0))
+
+# 4. Padronização e remoção final de resíduos (NAs gerados na padronização)
+df_padronizado <- scale(df_modelo)
+df_padronizado <- na.omit(df_padronizado)
+```
+
+## 2. Determinação do Número Ideal de Clusters (K)
+
+Para definir o número ideal de grupos, avaliamos o Método do Cotovelo (Within-Cluster Sum of Square) e o Método da Silhueta.
+
+```{r otimizacao_k, fig.width=10, fig.height=5}
+# Método do Cotovelo (WSS)
+grafico_cotovelo <- fviz_nbclust(df_padronizado, kmeans, method = "wss") +
+  labs(title = "Método do Cotovelo",
+       subtitle = "Definição do número ideal de regimes",
+       x = "Número de Clusters (k)", y = "Soma dos Quadrados Intra-Cluster") +
+  theme_classic()
+
+# Método da Silhueta
+grafico_silhueta_k <- fviz_nbclust(df_padronizado, kmeans, method = "silhouette") +
+  labs(title = "Método da Silhueta",
+       subtitle = "Maior valor indica o número ótimo de clusters",
+       x = "Número de Clusters (k)", y = "Largura Média da Silhueta") +
+  theme_classic()
+
+print(grafico_cotovelo)
+print(grafico_silhueta_k)
+```
+
+## 3. Aplicação do Modelo K-Means e Validação
+
+Com base nas análises anteriores, o algoritmo K-Means é aplicado utilizando $k = 4$. Para validar a qualidade matemática do agrupamento, calcula-se o **Índice de Davies-Bouldin**, onde valores menores indicam partições mais compactas e bem separadas.
+
+```{r aplicacao_kmeans}
+set.seed(123) # Fixa a semente para reprodutibilidade
+k_otimo <- 4 
+modelo_kmeans <- kmeans(df_padronizado, centers = k_otimo, nstart = 25)
+
+# Adiciona a classificação ao dataframe original
+df_resultado <- df_limpo %>%
+  mutate(Cluster = as.factor(modelo_kmeans$cluster))
+
+# Índice de Davies-Bouldin
+db_index <- index.DB(df_padronizado, modelo_kmeans$cluster, d = dist(df_padronizado))
+```
+
+**Índice de Davies-Bouldin obtido (k = `r k_otimo`):** `r round(db_index$DB, 4)`
+
+## 4. Perfil Descritivo dos Clusters (Regimes)
+
+A tabela a seguir apresenta as médias das variáveis originais para cada grupo formado, permitindo interpretar o "comportamento" físico de cada regime identificado.
+
+```{r tabela_perfil}
+perfil_clusters <- df_resultado %>%
+  group_by(Cluster) %>%
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE))) %>%
+  arrange(Cluster)
+
+kable(perfil_clusters, 
+      digits = 2, 
+      caption = "Características Médias de Cada Cluster",
+      align = "c")
+```
+
+## 5. Visualização dos Clusters e Análise de Silhueta
+
+Abaixo estão as representações gráficas para entender as fronteiras dos clusters, a dispersão das variáveis principais em cada grupo e a eficiência individual da classificação das observações (Silhueta do Modelo).
+
+```{r visualizacao_clusters, fig.width=8, fig.height=6}
+# Projeção PCA (Biplot)
+grafico_pca <- fviz_cluster(modelo_kmeans, data = df_padronizado,
+                            geom = "point",
+                            ellipse.type = "convex", 
+                            ggtheme = theme_classic(),
+                            main = "Dispersão dos Clusters (Componentes Principais)",
+                            palette = "jco")
+print(grafico_pca)
+```
+
+```{r boxplots, fig.width=10, fig.height=6}
+# Boxplots comparativos das Variáveis
+df_long_cluster <- df_resultado %>%
+  dplyr::select(Cluster, Nivel_Rio_m, Altura_Mare_m, Precipitacao_mm, Temperatura_C, Umidade_Relativa_pct) %>% 
+  pivot_longer(cols = -Cluster, names_to = "Variavel", values_to = "Valor")
+
+grafico_boxplots <- ggplot(df_long_cluster, aes(x = Cluster, y = Valor, fill = Cluster)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  facet_wrap(~ Variavel, scales = "free_y") +
+  theme_classic() +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Distribuição das Variáveis Chave por Cluster",
+       x = "Regime (Cluster)", y = "") +
+  theme(legend.position = "none",
+        strip.background = element_rect(fill = "gray95", colour = "black"))
+
+print(grafico_boxplots)
+```
+
+```{r silhueta_final, fig.width=8, fig.height=6}
+# Análise de Silhueta do Modelo Final
+distancias <- dist(df_padronizado)
+sil <- silhouette(modelo_kmeans$cluster, distancias)
+
+grafico_silhueta_modelo <- fviz_silhouette(sil, palette = "jco", ggtheme = theme_classic()) +
+  labs(title = paste("Qualidade do Agrupamento (Silhouette Score) - K =", k_otimo),
+       subtitle = "Valores próximos de 1 indicam boa coesão. Valores negativos indicam classificação incorreta.")
+
+print(grafico_silhueta_modelo)
+```
